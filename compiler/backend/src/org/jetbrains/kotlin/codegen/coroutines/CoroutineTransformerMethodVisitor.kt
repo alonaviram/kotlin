@@ -136,13 +136,19 @@ class CoroutineTransformerMethodVisitor(
 
         val defaultLabel = LabelNode()
         val tableSwitchLabel = LabelNode()
+        // The very first instruction of suspend lambda's 'invokeSuspend' method shall be label, otherwise, d8 emits warning about
+        // invalid debug info
+        val resumeImplStartLabel = LabelNode()
+        // also, the very last instruction shall be label
+        val resumeImplEndLabel = LabelNode()
         methodNode.instructions.apply {
-            val startLabel = LabelNode()
+            val firstStateLabel = LabelNode()
 
             // tableswitch(this.label)
             insertBefore(
                 actualCoroutineStart,
                 insnListOf(
+                    resumeImplStartLabel,
                     *withInstructionAdapter { loadCoroutineSuspendedMarker(languageVersionSettings) }.toArray(),
                     tableSwitchLabel,
                     // Allow debugger to stop on enter into suspend function
@@ -154,13 +160,13 @@ class CoroutineTransformerMethodVisitor(
                         0,
                         suspensionPoints.size,
                         defaultLabel,
-                        startLabel, *suspensionPointLabels.toTypedArray()
+                        firstStateLabel, *suspensionPointLabels.toTypedArray()
                     ),
-                    startLabel
+                    firstStateLabel
                 )
             )
 
-            insert(startLabel, withInstructionAdapter {
+            insert(firstStateLabel, withInstructionAdapter {
                 generateResumeWithExceptionCheck(languageVersionSettings.isReleaseCoroutines(), dataIndex, exceptionIndex)
             })
             insert(last, defaultLabel)
@@ -189,6 +195,33 @@ class CoroutineTransformerMethodVisitor(
             }
             writeDebugMetadata(methodNode, suspensionPointLabelNodes, spilledToVariableMapping)
         }
+
+        if (!isForNamedFunction) {
+            methodNode.instructions.insert(methodNode.instructions.last, resumeImplEndLabel)
+            fixLvtForParameters(methodNode, resumeImplStartLabel, resumeImplEndLabel)
+        }
+    }
+
+    private fun fixLvtForParameters(methodNode: MethodNode, startLabel: LabelNode, endLabel: LabelNode) {
+        // this
+        fixStartLabelOfLvtRecord(methodNode, startLabel, endLabel) { it.name == "this" && it.index == continuationIndex }
+        // data/result
+        fixStartLabelOfLvtRecord(methodNode, startLabel, endLabel) {
+            it.name == languageVersionSettings.dataFieldName() && it.index == dataIndex
+        }
+        // throwable
+        if (!languageVersionSettings.isReleaseCoroutines()) {
+            fixStartLabelOfLvtRecord(methodNode, startLabel, endLabel) { it.name == "throwable" && it.index == exceptionIndex }
+        }
+    }
+
+    private fun fixStartLabelOfLvtRecord(
+        methodNode: MethodNode,
+        startLabel: LabelNode,
+        endLabel: LabelNode,
+        predicate: (LocalVariableNode) -> Boolean
+    ) {
+        methodNode.localVariables.find(predicate)?.let { it.start = startLabel; it.end = endLabel }
     }
 
     private fun writeDebugMetadata(
